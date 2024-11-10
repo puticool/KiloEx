@@ -7,10 +7,18 @@ const headers = require("./src/header").default;
 const printLogo = require("./src/logo");
 const log = require('./src/logger');
 
-class KiloexAPIClient {
+class KiloexClient {
     constructor() {
         this.headers = headers;
         this.log = log;
+        this.marginLevels = [
+            { required: 10000, margin: 5000 },
+            { required: 2000, margin: 1000 },
+            { required: 1000, margin: 500 },
+            { required: 200, margin: 100 },
+            { required: 100, margin: 50 },
+            { required: 20, margin: 10 }
+        ];
     }
 
     async sleep(ms) {
@@ -50,6 +58,27 @@ class KiloexAPIClient {
                 const response = await axios.get(url, { headers: this.headers });
                 if (response.status === 200 && response.data.status === true) {
                     return { success: true, data: response.data.data };
+                } else {
+                    return { success: false, error: response.data.msg };
+                }
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        });
+    }
+    async claimOfflineCoins(account) {
+        return await this.retryWithDelay(async () => {
+            const url = 'https://opapi.kiloex.io/tg/coin/claim';
+            try {
+                const payload = {
+                    account: account,
+                    shared: false
+                };
+                
+                const response = await axios.post(url, payload, { headers: this.headers });
+                if (response.status === 200 && response.data.status === true) {
+                    this.log('Claim coin offline success', 'success');
+                    return { success: true };
                 } else {
                     return { success: false, error: response.data.msg };
                 }
@@ -115,14 +144,14 @@ class KiloexAPIClient {
         });
     }
 
-    async openOrder(account, positionType) {
+    async openOrder(account, positionType, margin) {
         return await this.retryWithDelay(async () => {
             const url = 'https://opapi.kiloex.io/tg/order/open';
             try {
                 const payload = {
                     account: account,
                     productId: 2,
-                    margin: 10,
+                    margin: margin,
                     leverage: 100,
                     positionType: positionType,
                     settleDelay: 300
@@ -130,7 +159,7 @@ class KiloexAPIClient {
 
                 const response = await axios.post(url, payload, { headers: this.headers });
                 if (response.status === 200 && response.data.status === true) {
-                    this.log(`Opened ${positionType} order successfully`, 'success');
+                    this.log(`Successfully opened ${positionType} order with margin ${margin}`, 'success');
                     return { success: true };
                 } else {
                     return { success: false, error: response.data.msg };
@@ -139,6 +168,24 @@ class KiloexAPIClient {
                 return { success: false, error: error.message };
             }
         });
+    }
+    async openOrdersForMargin(account, margin) {
+        this.log(`Starting to open orders with margin ${margin}...`, 'info');
+        
+        await this.sleep(2000);
+        const longResult = await this.openOrder(account, 'long', margin);
+        if (!longResult.success) {
+            this.log(`Error opening long order with margin ${margin}: ${longResult.error}`, 'error');
+            return false;
+        }
+        await this.sleep(2000);
+        const shortResult = await this.openOrder(account, 'short', margin);
+        if (!shortResult.success) {
+            this.log(`Error opening short order with margin ${margin}: ${shortResult.error}`, 'error');
+            return false;
+        }
+        this.log(`Finished opening order pair with margin ${margin}`, 'success');
+        return true;
     }
 
     async processAccount(account, name, index) {
@@ -153,6 +200,14 @@ class KiloexAPIClient {
 
             this.log(`Balance: ${userInfo.data.balance}`, 'custom');
             this.log(`Stamina: ${userInfo.data.stamina}`, 'custom');
+            this.log(`Auto Coins: ${userInfo.data.autoCoins}`, 'custom');
+            if (userInfo.data.autoCoins > 0) {
+                await this.sleep(2000);
+                const claimResult = await this.claimOfflineCoins(account);
+                if (!claimResult.success) {
+                    this.log(`Error claiming offline coins: ${claimResult.error}`, 'error');
+                }
+            }
 
             await this.sleep(2000);
             const referralResult = await this.checkAndBindReferral(account);
@@ -168,26 +223,16 @@ class KiloexAPIClient {
                 }
             }
 
-            if (userInfo.data.balance >= 20) {
-                this.log('Balance sufficient to open order, starting to open order...', 'info');
+            const balance = userInfo.data.balance;
+            const appropriateLevel = this.marginLevels.find(level => balance >= level.required);
 
-                await this.sleep(2000);
-                const longResult = await this.openOrder(account, 'long');
-                if (!longResult.success) {
-                    this.log(`Error opening long order: ${longResult.error}`, 'error');
-                }
-
-                await this.sleep(2000);
-                const shortResult = await this.openOrder(account, 'short');
-                if (!shortResult.success) {
-                    this.log(`Error opening short order: ${shortResult.error}`, 'error');
-                }
-
-                if (longResult.success && shortResult.success) {
-                    this.log('Both orders opened successfully', 'success');
-                }
+            if (appropriateLevel) {
+                this.log(`Balance ${balance} is eligible to open order with margin ${appropriateLevel.margin}`, 'info');
+                await this.openOrdersForMargin(account, appropriateLevel.margin);
+                
+            } else {
+                this.log(`Balance ${balance} is not eligible to open order`, 'warning');
             }
-
         } catch (error) {
             this.log(`Error processing account ${account}: ${error.message}`, 'error');
         }
@@ -233,13 +278,13 @@ class KiloexAPIClient {
                 await this.countdown(60 * 60);
             }
         } catch (error) {
-            this.log(`Lỗi chương trình: ${error.message}`, 'error');
+            this.log(`Program error: ${error.message}`, 'error');
             throw error;
         }
     }
 }
 
-const client = new KiloexAPIClient();
+const client = new KiloexClient();
 client.main().catch(err => {
     client.log(err.message, 'error');
     process.exit(1);

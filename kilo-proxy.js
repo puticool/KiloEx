@@ -8,29 +8,48 @@ const headers = require("./src/header").default;
 const printLogo = require("./src/logo");
 const log = require('./src/logger');
 
-class KiloexAPIClient {
+class KiloexClient {
     constructor() {
         this.headers = headers;
         this.log = log;
-        this.proxies = this.loadProxies();
+        this.marginLevels = [
+            { required: 10000, margin: 5000 },
+            { required: 2000, margin: 1000 },
+            { required: 1000, margin: 500 },
+            { required: 200, margin: 100 },
+            { required: 100, margin: 50 },
+            { required: 20, margin: 10 }
+        ];
+        this.proxies = [];
+        this.loadProxies();
     }
 
     loadProxies() {
         try {
             const proxyFile = path.join(__dirname, 'proxy.txt');
-            if (!fs.existsSync(proxyFile)) {
+            if (fs.existsSync(proxyFile)) {
+                this.proxies = fs.readFileSync(proxyFile, 'utf8')
+                    .replace(/\r/g, '')
+                    .split('\n')
+                    .filter(Boolean)
+                    .map(line => line.trim());
+                this.log(`Loaded ${this.proxies.length} proxies`, 'success');
+            } else {
                 this.log('Proxy file not found', 'warning');
-                return [];
             }
-            return fs.readFileSync(proxyFile, 'utf8')
-                .replace(/\r/g, '')
-                .split('\n')
-                .filter(Boolean)
-                .map(line => line.trim());
         } catch (error) {
             this.log(`Error reading proxy file: ${error.message}`, 'error');
-            return [];
         }
+    }
+
+    getProxyConfig(index) {
+        if (index < this.proxies.length) {
+            return {
+                httpsAgent: new HttpsProxyAgent(this.proxies[index]),
+                proxy: false
+            };
+        }
+        return {};
     }
 
     async checkProxyIP(proxy) {
@@ -38,6 +57,7 @@ class KiloexAPIClient {
             const proxyAgent = new HttpsProxyAgent(proxy);
             const response = await axios.get('https://api.ipify.org?format=json', {
                 httpsAgent: proxyAgent,
+                proxy: false,
                 timeout: 10000
             });
             if (response.status === 200) {
@@ -48,17 +68,6 @@ class KiloexAPIClient {
         } catch (error) {
             throw new Error(`Error checking proxy IP: ${error.message}`);
         }
-    }
-
-    getAxiosConfigWithProxy(index) {
-        if (this.proxies.length > 0 && this.proxies[index]) {
-            return {
-                headers: this.headers,
-                httpsAgent: new HttpsProxyAgent(this.proxies[index]),
-                timeout: 30000
-            };
-        }
-        return { headers: this.headers };
     }
 
     async sleep(ms) {
@@ -91,11 +100,14 @@ class KiloexAPIClient {
         readline.clearLine(process.stdout, 0);
     }
 
-    async getUserInfo(account, name, config) {
+    async getUserInfo(account, name, proxyConfig) {
         return await this.retryWithDelay(async () => {
             const url = `https://opapi.kiloex.io/tg/user/info?account=${account}&name=${name}&from=kiloextrade`;
             try {
-                const response = await axios.get(url, config);
+                const response = await axios.get(url, { 
+                    headers: this.headers,
+                    ...proxyConfig
+                });
                 if (response.status === 200 && response.data.status === true) {
                     return { success: true, data: response.data.data };
                 } else {
@@ -107,11 +119,39 @@ class KiloexAPIClient {
         });
     }
 
-    async checkAndBindReferral(account, config) {
+    async claimOfflineCoins(account, proxyConfig) {
+        return await this.retryWithDelay(async () => {
+            const url = 'https://opapi.kiloex.io/tg/coin/claim';
+            try {
+                const payload = {
+                    account: account,
+                    shared: false
+                };
+                
+                const response = await axios.post(url, payload, {
+                    headers: this.headers,
+                    ...proxyConfig
+                });
+                if (response.status === 200 && response.data.status === true) {
+                    this.log('Successfully claimed offline coins', 'success');
+                    return { success: true };
+                } else {
+                    return { success: false, error: response.data.msg };
+                }
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        });
+    }
+
+    async checkAndBindReferral(account, proxyConfig) {
         return await this.retryWithDelay(async () => {
             const checkUrl = `https://opapi.kiloex.io/tg/referral/code?account=${account}`;
             try {
-                const checkResponse = await axios.get(checkUrl, config);
+                const checkResponse = await axios.get(checkUrl, { 
+                    headers: this.headers,
+                    ...proxyConfig
+                });
                 
                 if (checkResponse.status === 200 && checkResponse.data.status === true) {
                     if (!checkResponse.data.data.length) {
@@ -123,7 +163,10 @@ class KiloexAPIClient {
                             code: "i4gr77mh"
                         };
                         
-                        const bindResponse = await axios.post(bindUrl, payload, config);
+                        const bindResponse = await axios.post(bindUrl, payload, { 
+                            headers: this.headers,
+                            ...proxyConfig
+                        });
                         
                         if (bindResponse.status === 200 && bindResponse.data.status === true) {
                             this.log('Bind referral code successful', 'success');
@@ -141,7 +184,7 @@ class KiloexAPIClient {
         });
     }
 
-    async updateMining(account, stamina, config) {
+    async updateMining(account, stamina, proxyConfig) {
         return await this.retryWithDelay(async () => {
             const url = 'https://opapi.kiloex.io/tg/mining/update';
             try {
@@ -149,7 +192,10 @@ class KiloexAPIClient {
                     account: account,
                     stamina: stamina,
                     coin: stamina
-                }, config);
+                }, { 
+                    headers: this.headers,
+                    ...proxyConfig
+                });
 
                 if (response.status === 200 && response.data.status === true) {
                     this.log('Mining successful', 'success');
@@ -163,22 +209,25 @@ class KiloexAPIClient {
         });
     }
 
-    async openOrder(account, positionType, config) {
+    async openOrder(account, positionType, margin, proxyConfig) {
         return await this.retryWithDelay(async () => {
             const url = 'https://opapi.kiloex.io/tg/order/open';
             try {
                 const payload = {
                     account: account,
                     productId: 2,
-                    margin: 10,
+                    margin: margin,
                     leverage: 100,
                     positionType: positionType,
                     settleDelay: 300
                 };
 
-                const response = await axios.post(url, payload, config);
+                const response = await axios.post(url, payload, { 
+                    headers: this.headers,
+                    ...proxyConfig
+                });
                 if (response.status === 200 && response.data.status === true) {
-                    this.log(`Opened ${positionType} order successfully`, 'success');
+                    this.log(`Successfully opened ${positionType} order with margin ${margin}`, 'success');
                     return { success: true };
                 } else {
                     return { success: false, error: response.data.msg };
@@ -189,12 +238,31 @@ class KiloexAPIClient {
         });
     }
 
+    async openOrdersForMargin(account, margin, proxyConfig) {
+        this.log(`Starting to open orders with margin ${margin}...`, 'info');
+        
+        await this.sleep(2000);
+        const longResult = await this.openOrder(account, 'long', margin, proxyConfig);
+        if (!longResult.success) {
+            this.log(`Error opening long order with margin ${margin}: ${longResult.error}`, 'error');
+            return false;
+        }
+        await this.sleep(2000);
+        const shortResult = await this.openOrder(account, 'short', margin, proxyConfig);
+        if (!shortResult.success) {
+            this.log(`Error opening short order with margin ${margin}: ${shortResult.error}`, 'error');
+            return false;
+        }
+        this.log(`Finished opening order pair with margin ${margin}`, 'success');
+        return true;
+    }
+
     async processAccount(account, name, index) {
         try {
             let proxyIP = "no proxy";
-            const axiosConfig = this.getAxiosConfigWithProxy(index);
+            const proxyConfig = this.getProxyConfig(index);
             
-            if (this.proxies[index]) {
+            if (proxyConfig.httpsAgent) {
                 try {
                     proxyIP = await this.checkProxyIP(this.proxies[index]);
                 } catch (error) {
@@ -204,7 +272,7 @@ class KiloexAPIClient {
             
             console.log(`========== Account ${index + 1} | ${name.green} | IP: ${proxyIP} ==========`);
 
-            const userInfo = await this.getUserInfo(account, name, axiosConfig);
+            const userInfo = await this.getUserInfo(account, name, proxyConfig);
             if (!userInfo.success) {
                 this.log(`Unable to retrieve account information: ${userInfo.error}`, 'error');
                 return;
@@ -212,39 +280,37 @@ class KiloexAPIClient {
 
             this.log(`Balance: ${userInfo.data.balance}`, 'custom');
             this.log(`Stamina: ${userInfo.data.stamina}`, 'custom');
-
+            this.log(`Auto Coins: ${userInfo.data.autoCoins}`, 'custom');
+            if (userInfo.data.autoCoins > 0) {
+                await this.sleep(2000);
+                const claimResult = await this.claimOfflineCoins(account, proxyConfig);
+                if (!claimResult.success) {
+                    this.log(`Error claiming offline coins: ${claimResult.error}`, 'error');
+                }
+            }
             await this.sleep(2000);
-            const referralResult = await this.checkAndBindReferral(account, axiosConfig);
+            const referralResult = await this.checkAndBindReferral(account, proxyConfig);
             if (!referralResult.success) {
                 this.log(`Error checking/binding referral: ${referralResult.error}`, 'error');
             }
 
             if (userInfo.data.stamina > 0) {
                 await this.sleep(2000);
-                const miningResult = await this.updateMining(account, userInfo.data.stamina, axiosConfig);
+                const miningResult = await this.updateMining(account, userInfo.data.stamina, proxyConfig);
                 if (!miningResult.success) {
                     this.log(`Mining error: ${miningResult.error}`, 'error');
                 }
             }
 
-            if (userInfo.data.balance >= 20) {
-                this.log('Balance sufficient to open order, starting to open order...', 'info');
+            const balance = userInfo.data.balance;
+            const appropriateLevel = this.marginLevels.find(level => balance >= level.required);
                 
-                await this.sleep(2000);
-                const longResult = await this.openOrder(account, 'long', axiosConfig);
-                if (!longResult.success) {
-                    this.log(`Error opening long order: ${longResult.error}`, 'error');
-                }
-
-                await this.sleep(2000);
-                const shortResult = await this.openOrder(account, 'short', axiosConfig);
-                if (!shortResult.success) {
-                    this.log(`Error opening short order: ${shortResult.error}`, 'error');
-                }
-
-                if (longResult.success && shortResult.success) {
-                    this.log('Both orders opened successfully', 'success');
-                }
+            if (appropriateLevel) {
+                this.log(`Balance ${balance} is eligible to open order with margin ${appropriateLevel.margin}`, 'info');
+                await this.openOrdersForMargin(account, appropriateLevel.margin, proxyConfig);
+                
+            } else {
+                this.log(`Balance ${balance} is not eligible to open order`, 'warning');
             }
 
         } catch (error) {
@@ -298,7 +364,7 @@ class KiloexAPIClient {
     }
 }
 
-const client = new KiloexAPIClient();
+const client = new KiloexClient();
 client.main().catch(err => {
     client.log(err.message, 'error');
     process.exit(1);
